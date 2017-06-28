@@ -16,6 +16,7 @@ import random
 from scapy.data import KnowledgeBase
 from scapy.config import conf
 from scapy.layers.inet import IP, TCP, TCPOptions
+from scapy.layers.inet6 import IPv6
 from scapy.packet import NoPayload, Packet
 from scapy.error import warning, Scapy_Exception, log_runtime
 from scapy.volatile import RandInt, RandByte, RandChoice, RandNum, RandShort, RandString
@@ -554,3 +555,211 @@ interface and may (are likely to) be different than those generated on
         os._exit(0)
     return result
 
+# Old p0f 2 format
+# File format (according to p0f.fp) :
+#
+# wwww:ttt:D:ss:OOO...:QQ:OS:Details
+#
+# wwww    - window size
+# ttt     - initial TTL
+# D       - don't fragment bit  (0=unset, 1=set)
+# ss      - overall SYN packet size
+# OOO     - option value and order specification
+# QQ      - quirks list
+# OS      - OS genre
+# details - OS description
+
+# New p0f3 format
+#
+#File format :
+#
+# ipversion:ttl:mss:winscale:tcpolayout:quirks:winsize:ipolength:payloadsize
+#
+# ipversion   - IP version: 4 / 6
+# ttl         - Initial TTL
+# mss         - maximum segment Can be a constant or *.
+# winscale    - Window Scale: window scale specified during the three way handshake. Can be a constant or *.
+# tcpolayout  - TCP options layout: list of TCP options in the order they are seen in a TCP packet.
+# quirks      - comma separated list of unusual things
+# winsize     - Window Size: window size specified in the TCP header.
+# ipolength   - IP options length: OK
+# payloadsize -  class: TCP payload size. Can be 0 (no data), + (1 or more bytes of data) or *.
+def p0f3_impersonate(pkt, signature, extrahops=0):
+    """For now, only TCP Syn packets are supported.
+Some specifications of the p0f.fp file are not (yet) implemented."""
+
+    pkt = pkt.copy()
+    while pkt.haslayer(IP) and pkt.haslayer(TCP):
+        pkt = pkt.getlayer(IP)
+        if isinstance(pkt.payload, TCP):
+            break
+        pkt = pkt.payload
+
+    # IPversion
+    if signature[0] == '4':
+        if not pkt.haslayer(IP) and not pkt.haslayer(IPv6):
+            pkt = IP() / pkt
+        if pkt.haslayer(IPv6):
+            raise TypeError("IPv4 specified in signature but ipv6 packet was given as parameter")
+
+    elif signature[0] == '6':
+        if not pkt.haslayer(IP) and not pkt.haslayer(IPv6):
+            pkt = IPv6() / pkt
+        if pkt.haslayer(IP):
+            raise TypeError("IPv6 specified in signature but ipv4 packet was given as parameter")
+    else:
+        raise TypeError(("Only IPv4 or IPv6 is allowed, not : %s") % signature[0])
+
+    # TTL
+    if signature[1].isdigit():
+        pkt.ttl = int(signature[1]) - extrahops
+    elif signature[1].find("-") != -1:
+        diff1, diff2 = signature[1].split("-")
+        pkt.ttl = int(diff1) - int(diff2)
+
+    # IP options length
+    if signature[2] != '0' and signature[2] != '.':
+        if signature[2].isdigit():
+            pkt.getlayer(IP).options = urandom(int(signature[2]))
+            pass
+        raise TypeError("IP option length not recognized, must be . * or digit")
+
+    # TCP Payload
+    if signature[7] != '0' and signature != '.':
+        if signature[7].isdigit():
+            load = RandString(random.randint(1, int(signature[7])))
+            pkt.payload.payload = load
+        elif signature[7] == '*':
+            load = RandString(random.randint(1, 10))
+            pkt.payload.payload = load
+        else:
+            raise TypeError("Payload size in signature is not valid")
+
+    # Options
+    options = []
+    if signature[5] != '.':
+        for opt in signature[5].split(','):
+            if opt == 'mss':
+                # MSS might have a maximum size because of window size
+                # specification
+                if signature[4].split(",")[0].isdigit() and not signature[3].isdigit():
+                    maxmss = (2L ** 16 - 1) / int(signature[4].split(",")[0])
+                elif signature[3].isdigit():
+                    maxmss = int(signature[3])
+                else:
+                    raise TypeError(("Coefficient window size not implemented: %s") % signature[4])
+                options.append(('MSS', random.randint(1, maxmss)))
+            elif opt == 'ws':
+                if signature[4].split(",")[1].isdigit() and not signature[6].find('exws') != -1:
+                    options.append(('WScale', int(signature[4].split(",")[1])))
+                if signature[6].find('exws') != -1:
+                    options.append(('WScale', 14))
+                else:
+                    options.append(('WScale', RandByte()))
+            elif opt == 'sok':
+                options.append(('SAckOK', ''))
+            elif opt == 'sack':
+                options.append(('SAck', ''))
+            elif opt == 'ts':
+                options.append(('Timestamp', (0, 0)))
+                if signature[6].find("ts1-") != -1:
+                    options.append(('Timestamp', (0, 0)))
+                if signature[6].find("ts2+") != -1:
+                    options.append(('Timestamp', RandInt()))
+            elif opt == 'nop':
+                options.append(('NOP', None))
+            elif opt.find('eol+') != -1:  #
+                options.append(('EOL', None))
+            else:
+                warning("unhandled TCP option " + opt)
+
+            pkt.payload.options = options
+
+    # MSS
+    if signature[3].isdigit():
+        if not filter(lambda x: x[0] == 'MSS', options):
+            raise Scapy_Exception("Requires MSS, and MSS option not set")
+    elif signature[3] == '*':
+        if not filter(lambda x: x[0] == 'MSS', options):
+            raise Scapy_Exception("Requires MSS, and MSS option not set")
+
+    # Window scale
+    if signature[5].isdigit():
+        if not filter(lambda x: x[0] == 'WScale', options):
+            raise Scapy_Exception("Requires WScale, and WScale option not set")
+    elif signature[5] == '*':
+        if not filter(lambda x: x[0] == 'WScale', options):
+            raise Scapy_Exception("Requires WScale, and WScale option not set")
+
+    # Window Size
+    # TODO : ADD COEF SUPPORT
+    if signature[4].split(",")[0] == '*':
+        pkt.payload.window = RandShort()
+    elif signature[4].split(",")[0].isdigit():
+        pkt.payload.window = int(signature[4].split(",")[0])
+    elif (signature[4].split(",")[0]).find("*") or signature[4].find("%"):
+        raise TypeError("Coefficient window size not implemented: %s" % signature[4])
+
+    # Quirks description :
+    # df: don't fragment bit is set in the IP header
+    # id+: df bit is set and IP identification field is non zero
+    # id-: df bit is not set and IP identification is zero
+    # ecn: explicit congestion flag is set
+    # 0+: reserved ("must be zero") field in IP header is not actually zero
+    # flow: flow label in IPv6 header is non-zero
+    # seq-: sequence number is zero
+    # ack+: ACK field is non-zero but ACK flag is not set
+    # ack-: ACK field is zero but ACK flag is set
+    # uptr+: URG field is non-zero but URG flag not set
+    # urgf+: URG flag is set
+    # pushf+: PUSH flag is set
+    # ts1-: timestamp 1 is zero
+    # ts2+: timestamp 2 is non-zero in a SYN packet
+    # opt+: non-zero data in options segment
+    # exws: excessive window scaling factor (window scale greater than 14)
+    # bad: malformed TCP options
+    # flags: can be FSRPAUECN  ip DF MF evil
+    # Quirks
+    if signature[6] != '.':
+        for qq in signature[6].split(","):
+            if qq == 'df':
+                pkt.flags = 'DF'
+            elif qq == 'id+':
+                pkt.flags = 'DF'
+                pkt.id = RandShort()
+            elif qq == 'id-':
+                pkt.flags = 0
+                pkt.id = 0
+            elif qq == 'ecn':
+                pkt.flags = 'evil'
+            elif qq == '0+':
+                pkt.flags = 1
+            elif qq == 'flow':
+                if signature[0] == '6':
+                    pkt.getlayer(IPv6).fl = 1
+                    pass
+                else:
+                    raise TypeError("flow set but IPv4 packet")
+            elif qq == 'seq-':
+                pkt.payload.seq = 0
+            elif qq == 'ack+':
+                pkt.payload.ack = RandInt()
+            elif qq == 'ack-':
+                pkt.payload.ack = 0
+                pkt.payload.flags += 'A'
+            elif qq == 'uptr+':
+                pkt.payload.urgptr = RandShort()
+            elif qq == 'urgf+':
+                pkt.payload.flags += 'U'
+            elif qq == 'pushf+':
+                pkt.payload.flags += 'P'
+            elif qq == 'opt+':
+                if signature[5] == '.':
+                    raise TypeError("Asked for non zero data in tcp option but no options specified in sign")
+            elif qq == 'bad':
+                load = RandString(random.randint(1, 10))
+                pkt.payload.option = load
+
+    while pkt.underlayer:
+        pkt = pkt.underlayer
+    return pkt
